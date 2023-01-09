@@ -8,4 +8,7 @@ which can be used to encrypt shellcode using XOR and a string key.
 
 Enjoy!
 
--Joff Thyer (@yoda66)
+-Joff Thyer
+
+@joff_thyer
+@yoda66@ioc.exchange
